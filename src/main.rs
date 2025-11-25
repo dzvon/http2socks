@@ -27,6 +27,10 @@ struct Config {
     /// The address and port of the SOCKS proxy server to forward requests to
     #[arg(short, long, default_value = "127.0.0.1:1080")]
     socks: String,
+
+    /// Forward mode: forward raw TCP traffic directly to SOCKS5 (no HTTP protocol handling)
+    #[arg(short, long, default_value_t = false)]
+    forward: bool,
 }
 
 // Main entry point - sets up HTTP proxy server and handles incoming connections
@@ -37,13 +41,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let config = Config::parse();
     let listener = TcpListener::bind(&config.listen).await?;
-    info!("HTTP proxy listening on: {}", config.listen);
+
+    if config.forward {
+        info!("TCP forward mode listening on: {}", config.listen);
+        info!("Forwarding all traffic to SOCKS5: {}", config.socks);
+    } else {
+        info!("HTTP proxy listening on: {}", config.listen);
+    }
 
     while let Ok((client, addr)) = listener.accept().await {
         info!("New connection from: {}", addr);
         let socks_addr = config.socks.clone();
+        let forward_mode = config.forward;
         tokio::spawn(async move {
-            if let Err(e) = handle_client(client, &socks_addr).await {
+            let result = if forward_mode {
+                handle_forward_client(client, &socks_addr).await
+            } else {
+                handle_client(client, &socks_addr).await
+            };
+
+            if let Err(e) = result {
                 error!("Client handling error: {}", e);
                 // Print the error chain
                 let mut error_chain = String::new();
@@ -273,6 +290,19 @@ async fn connect_socks5(
     socks.read_exact(&mut port).await?;
 
     Ok(socks)
+}
+
+// Handles forward mode - directly forwards TCP traffic to SOCKS5 proxy
+#[instrument(skip_all)]
+async fn handle_forward_client(client: TcpStream, socks_addr: &str) -> Result<(), Box<dyn Error>> {
+    // Simply connect to SOCKS5 and forward all traffic
+    let socks = TcpStream::connect(socks_addr).await.map_err(|e| {
+        error!("Failed to connect to SOCKS5 server: {}", e);
+        e
+    })?;
+
+    info!("Forwarding connection to SOCKS5 server");
+    proxy_data(client, socks).await
 }
 
 // Handles bidirectional data transfer between client and SOCKS connection

@@ -26,8 +26,11 @@ cargo build --release
 
 - `-l, --listen <ADDRESS>`: HTTP proxy listen address (default: 127.0.0.1:8080)
 - `-s, --socks <ADDRESS>`: SOCKS5 proxy server address (default: 127.0.0.1:1080)
+- `-f, --forward`: Forward mode - forward raw TCP traffic directly to SOCKS5 (no HTTP protocol handling)
 
 ## Examples
+
+### HTTP Proxy Mode (default)
 
 ```bash
 # Use with Tor
@@ -36,6 +39,18 @@ cargo build --release
 # Configure your browser to use HTTP proxy at 127.0.0.1:8080
 # Or use with curl:
 curl --proxy http://127.0.0.1:8080 https://example.com
+```
+
+### Forward Mode
+
+Forward mode listens on a TCP port and forwards all traffic directly to the SOCKS5 proxy server without any HTTP protocol handling:
+
+```bash
+# Forward all traffic to SOCKS5 proxy
+./http2socks --forward --listen 127.0.0.1:8080 --socks 127.0.0.1:1080
+
+# This creates a simple TCP tunnel - any client connecting to 127.0.0.1:8080
+# will have their traffic forwarded directly to the SOCKS5 server at 127.0.0.1:1080
 ```
 
 ## Logging
