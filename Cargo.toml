@@ -5,7 +5,7 @@ edition = "2021"
 description = "A simple HTTP to SOCKS5 proxy bridge"
 
 [dependencies]
-thiserror = "1.0"
+thiserror = "2.0"
 tokio = { version = "1.28", features = ["io-util", "net", "rt", "macros"] }
 clap = { version = "4.3", features = ["derive"] }
 tracing = "0.1"
