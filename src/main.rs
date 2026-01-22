@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fmt::Write;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{error, info, instrument, warn};
+use tracing::{error, info, instrument, warn, Instrument, Span};
 
 // SOCKS Protocol Constants
 const SOCKS5_VERSION: u8 = 0x05;
@@ -50,37 +50,41 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     while let Ok((client, addr)) = listener.accept().await {
-        info!("New connection from: {}", addr);
+        let connection_span = tracing::info_span!("connection", client.addr = %addr);
         let socks_addr = config.socks.clone();
         let forward_mode = config.forward;
-        tokio::spawn(async move {
-            let result = if forward_mode {
-                handle_forward_client(client, &socks_addr).await
-            } else {
-                handle_client(client, &socks_addr).await
-            };
 
-            if let Err(e) = result {
-                error!("Client handling error: {}", e);
-                // Print the error chain
-                let mut error_chain = String::new();
-                let mut source = e.source();
-                while let Some(e) = source {
-                    let _ = writeln!(error_chain, "Caused by: {e}");
-                    source = e.source();
-                }
-                if !error_chain.is_empty() {
-                    error!("Error chain:\n{}", error_chain);
+        tokio::spawn(
+            async move {
+                let result = if forward_mode {
+                    handle_forward_client(client, &socks_addr).await
+                } else {
+                    handle_client(client, &socks_addr).await
+                };
+
+                if let Err(e) = result {
+                    error!("Client handling error: {}", e);
+                    // Print the error chain
+                    let mut error_chain = String::new();
+                    let mut source = e.source();
+                    while let Some(e) = source {
+                        let _ = writeln!(error_chain, "Caused by: {e}");
+                        source = e.source();
+                    }
+                    if !error_chain.is_empty() {
+                        error!("Error chain:\n{}", error_chain);
+                    }
                 }
             }
-        });
+            .instrument(connection_span),
+        );
     }
 
     Ok(())
 }
 
 // Handles individual client connections and processes HTTP requests
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(target, mode))]
 async fn handle_client(mut client: TcpStream, socks_addr: &str) -> Result<(), Box<dyn Error>> {
     let mut buffer = [0u8; 4096];
     let n = client.read(&mut buffer).await.map_err(|e| {
@@ -95,6 +99,9 @@ async fn handle_client(mut client: TcpStream, socks_addr: &str) -> Result<(), Bo
     if is_connect_request(&buffer[..n]) {
         // Handle CONNECT tunnel (HTTPS)
         if let Some((host, port)) = parse_connect_request(&buffer[..n]) {
+            Span::current().record("target", format!("{}:{}", host, port));
+            Span::current().record("mode", "CONNECT");
+
             let socks = connect_socks5(&host, port, socks_addr).await.map_err(|e| {
                 error!("Failed to connect via SOCKS5: {}", e);
                 e
@@ -116,6 +123,9 @@ async fn handle_client(mut client: TcpStream, socks_addr: &str) -> Result<(), Bo
     } else {
         // Handle regular HTTP request
         if let Some((method, host, port, path)) = parse_http_request(&buffer[..n]) {
+            Span::current().record("target", format!("{}:{}", host, port));
+            Span::current().record("mode", "HTTP");
+
             let socks = connect_socks5(&host, port, socks_addr).await?;
 
             // Rewrite request to absolute-form
@@ -212,7 +222,7 @@ fn parse_connect_request(buffer: &[u8]) -> Option<(String, u16)> {
 }
 
 // Establishes connection to SOCKS5 proxy server
-#[instrument]
+#[instrument(skip(socks_addr), fields(dst = %host, port = %port))]
 async fn connect_socks5(
     host: &str,
     port: u16,
@@ -293,7 +303,7 @@ async fn connect_socks5(
 }
 
 // Handles forward mode - directly forwards TCP traffic to SOCKS5 proxy
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(socks_addr = %socks_addr))]
 async fn handle_forward_client(client: TcpStream, socks_addr: &str) -> Result<(), Box<dyn Error>> {
     // Simply connect to SOCKS5 and forward all traffic
     let socks = TcpStream::connect(socks_addr).await.map_err(|e| {
