@@ -86,26 +86,50 @@ async fn main() -> Result<(), Box<dyn Error>> {
 // Handles individual client connections and processes HTTP requests
 #[instrument(skip_all, fields(target, mode))]
 async fn handle_client(mut client: TcpStream, socks_addr: &str) -> Result<(), Box<dyn Error>> {
-    let mut buffer = [0u8; 4096];
-    let n = client.read(&mut buffer).await.map_err(|e| {
-        error!("Failed to read from client: {}", e);
-        e
-    })?;
+    let mut buffer = Vec::new();
+    let mut temp_buf = [0u8; 1024];
+    let mut header_end = None;
 
-    if n == 0 {
-        return Err("Client closed connection".into());
+    // Read until we find the end of HTTP headers (\r\n\r\n)
+    loop {
+        let n = client.read(&mut temp_buf).await.map_err(|e| {
+            error!("Failed to read from client: {}", e);
+            e
+        })?;
+
+        if n == 0 {
+            if buffer.is_empty() {
+                return Ok(());
+            }
+            break;
+        }
+
+        buffer.extend_from_slice(&temp_buf[..n]);
+
+        if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+            header_end = Some(pos + 4);
+            break;
+        }
+
+        if buffer.len() > 16384 {
+            return Err("Headers too large".into());
+        }
     }
 
-    if is_connect_request(&buffer[..n]) {
+    let header_len = header_end.unwrap_or(buffer.len());
+    let (header_part, extra_part) = buffer.split_at(header_len);
+
+    if is_connect_request(header_part) {
         // Handle CONNECT tunnel (HTTPS)
-        if let Some((host, port)) = parse_connect_request(&buffer[..n]) {
+        if let Some((host, port)) = parse_connect_request(header_part) {
             Span::current().record("target", format!("{}:{}", host, port));
             Span::current().record("mode", "CONNECT");
 
-            let socks = connect_socks5(&host, port, socks_addr).await.map_err(|e| {
+            let mut socks = connect_socks5(&host, port, socks_addr).await.map_err(|e| {
                 error!("Failed to connect via SOCKS5: {}", e);
                 e
             })?;
+
             client
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await
@@ -113,6 +137,12 @@ async fn handle_client(mut client: TcpStream, socks_addr: &str) -> Result<(), Bo
                     error!("Failed to send connection established: {}", e);
                     e
                 })?;
+
+            // If we read more than headers (unlikely for CONNECT but possible), forward it
+            if !extra_part.is_empty() {
+                socks.write_all(extra_part).await?;
+            }
+
             proxy_data(client, socks).await?;
         } else {
             warn!("Failed to parse CONNECT request");
@@ -122,19 +152,24 @@ async fn handle_client(mut client: TcpStream, socks_addr: &str) -> Result<(), Bo
         }
     } else {
         // Handle regular HTTP request
-        if let Some((method, host, port, path)) = parse_http_request(&buffer[..n]) {
+        if let Some((method, host, port, path)) = parse_http_request(header_part) {
             Span::current().record("target", format!("{}:{}", host, port));
             Span::current().record("mode", "HTTP");
 
-            let socks = connect_socks5(&host, port, socks_addr).await?;
+            let mut socks = connect_socks5(&host, port, socks_addr).await?;
 
-            // Rewrite request to absolute-form
-            let new_request = format!("{method} {path} HTTP/1.1\r\n");
-            let mut modified_request = buffer[..n].to_vec();
-            modified_request.splice(..first_line_len(&buffer[..n]), new_request.bytes());
+            // Rewrite request to absolute-form or original request line
+            let new_request_line = format!("{method} {path} HTTP/1.1\r\n");
+            let mut modified_request = header_part.to_vec();
+            modified_request.splice(..first_line_len(header_part), new_request_line.bytes());
 
-            let mut socks = socks;
             socks.write_all(&modified_request).await?;
+
+            // Forward any body that might have been read
+            if !extra_part.is_empty() {
+                socks.write_all(extra_part).await?;
+            }
+
             proxy_data(client, socks).await?;
         } else {
             client
